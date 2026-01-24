@@ -585,8 +585,14 @@ def create_frozen_predictor(
         first_input = kwargs[input_vars[0]]
         input_was_1d = np.asarray(first_input).ndim <= 1
 
-        # Convert all inputs to 2D and run
+        # Convert all inputs to 2D
         arrays = [np.atleast_2d(kwargs[name]).astype(np.float64) for name in input_vars]
+        
+        # Broadcast all arrays to a common shape so PyTensor doesn't complain
+        # about runtime broadcasting (e.g., when mixing scalars with arrays)
+        broadcast_shape = np.broadcast_shapes(*[a.shape for a in arrays])
+        arrays = [np.broadcast_to(a, broadcast_shape) for a in arrays]
+        
         results = compiled_fn(*arrays)
 
         # Build output dict, squeezing scenario dimension if input was 1D
