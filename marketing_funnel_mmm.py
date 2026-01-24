@@ -382,11 +382,11 @@ def _(funnel_model, idata):
     # Two versions: mean-only (fast) and with HDI (for uncertainty bands)
     # Post-processing (mean/percentile) is computed inside pytensor for efficiency
     if idata:
-        saturation_predictor_mean, _ = create_saturation_predictor(
-            funnel_model, idata, n_samples=200, include_hdi=False
+        saturation_predictor_mean= create_saturation_predictor(
+            funnel_model, idata, n_samples=500, include_hdi=False
         )
-        saturation_predictor_hdi, _ = create_saturation_predictor(
-            funnel_model, idata, n_samples=200, include_hdi=True
+        saturation_predictor_hdi= create_saturation_predictor(
+            funnel_model, idata, n_samples=500, include_hdi=True
         )
     else:
         saturation_predictor_mean = None
@@ -597,11 +597,11 @@ def _(funnel_model, idata):
     # Two versions: mean-only (fast) and with HDI (for uncertainty bands)
     # Post-processing (mean/percentile) is computed inside pytensor for efficiency
     if idata:
-        response_predictor_mean, _ = create_response_predictor(
-            funnel_model, idata, n_samples=200, include_hdi=False
+        response_predictor_mean= create_response_predictor(
+            funnel_model, idata, n_samples=500, include_hdi=False
         )
-        response_predictor_hdi, _ = create_response_predictor(
-            funnel_model, idata, n_samples=200, include_hdi=True
+        response_predictor_hdi= create_response_predictor(
+            funnel_model, idata, n_samples=500, include_hdi=True
         )
     else:
         response_predictor_mean = None
@@ -848,8 +848,8 @@ def _(
 def _(funnel_model, idata):
     # Create compiled pytensor predictor for sales time series
     if idata:
-        sales_timeseries_predictor, _ = create_sales_timeseries_predictor(
-            funnel_model, idata, n_samples=200
+        sales_timeseries_predictor= create_sales_timeseries_predictor(
+            funnel_model, idata, n_samples=500
         )
     else:
         sales_timeseries_predictor = None
@@ -1255,7 +1255,7 @@ def create_sales_timeseries_predictor(model, inference_data, n_samples=200):
             spend_lower=np.asarray(spend_lower),
         )
 
-    return predict_fn, _compiled_fn
+    return predict_fn
 
 
 @app.cell

@@ -97,7 +97,7 @@ def _():
         "intercept_purchases": 10.0,    # Base purchases (intercept)
         "conversion_rate_visits": 0.3,         # Conversion rate (purchases per visit)
         "trend_purchases": 0.05,    # Weekly trend in purchases
-        "sigma_purchases": 5.0,     # Purchases noise
+        "sigma_purchases": 1.0,     # Purchases noise
     }
     
     def generate_mediation_data(n_periods=52, seed=42):
@@ -109,8 +109,8 @@ def _():
         dates = pd.date_range("2024-01-01", periods=n_periods, freq="W")
         
         # Generate spend with some seasonality
-        spend_base = 50 + 20 * np.sin(2 * np.pi * t / 52)  # Yearly cycle
-        spend_noise = rng.normal(0, 10, n_periods)
+        spend_base = 50 + 30 * np.sin(2 * np.pi * t / 52)  # Yearly cycle
+        spend_noise = rng.normal(0, 20, n_periods)
         spend = np.maximum(spend_base + spend_noise, 0)  # Minimum spend of 60
         
         # Saturation function (Hill)
@@ -236,7 +236,7 @@ def _(df):
         # === Stage 2: Visits -> Purchases ===
         # Purchases coefficients
         intercept_purchases = pm.Normal("intercept_purchases", mu=10, sigma=10)
-        conversion_rate_visits = pm.Normal("conversion_rate_visits", mu=0.1, sigma=0.05)
+        conversion_rate_visits = pm.Normal("conversion_rate_visits", mu=0.3, sigma=0.15)  # Wider prior covering true value
         trend_purchases = pm.Normal("trend_purchases", mu=0, sigma=0.1)
         
         # Expected purchases (depends on visits!)
@@ -384,7 +384,7 @@ def _(idata, mediation_model):
     #
     # Note: post_fn receives PyTensor tensors, so use pt operations (not np)
     
-    _n_samples = 200
+    _n_samples = 500
     _idx_low = int(round((_n_samples - 1) * 0.05))
     _idx_high = int(round((_n_samples - 1) * 0.95))
     
@@ -396,7 +396,7 @@ def _(idata, mediation_model):
     if idata is not None:
         # Predictor for Stage 1: Spend -> Visits
         # This predicts mu_visits given new spend values
-        visits_predictor, _ = create_frozen_predictor(
+        visits_predictor = create_frozen_predictor(
             model=mediation_model,
             inference_data=idata,
             response_exprs={
@@ -413,7 +413,7 @@ def _(idata, mediation_model):
         # Note: 'visits' is an observed RV that depends on 'spend' input.
         # The predictor replaces the observed RV with its expected value (mu_visits)
         # for response curve predictions at arbitrary input sizes.
-        purchases_predictor, _ = create_frozen_predictor(
+        purchases_predictor = create_frozen_predictor(
             model=mediation_model,
             inference_data=idata,
             response_exprs={
@@ -422,7 +422,6 @@ def _(idata, mediation_model):
                 "mu_purchases_high": ("mu_purchases", _high_fn),
             },
             input_vars=["spend", "time_idx"],  # visits comes from mu_visits in the graph
-            observed_rv_strategy="expected_value",  # Use expected value for response curves
             num_samples=_n_samples,
             rng=42,
         )
