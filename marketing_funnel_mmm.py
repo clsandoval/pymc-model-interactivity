@@ -28,17 +28,15 @@ with app.setup(hide_code=True):
     import pymc as pm
     import pytensor
     import pytensor.tensor as pt
-    from pytensor.graph.replace import clone_replace, vectorize_graph
-    from pytensor.graph.rewriting import rewrite_graph
-    from pytensor.graph.traversal import ancestors
-    from pytensor.graph.basic import graph_inputs
-
     # Import components from pymc-marketing
     from pymc_marketing.mmm.hsgp import SoftPlusHSGP
     from pymc_marketing.mmm.transformers import geometric_adstock, hill_function
 
     # Import local data generation
     from generate_data import generate_marketing_funnel_data, TRUE_PARAMS
+
+    # Import posterior predictor
+    from frozen_predictor import create_frozen_predictor
 
 
 @app.cell(hide_code=True)
@@ -1013,181 +1011,11 @@ def _(
 
 
 @app.function
-def create_posterior_predictor(model, inference_data, response_exprs, input_vars, n_samples=200):
-    """
-    Create a compiled pytensor function for posterior predictions.
-
-    Extracts response expressions from the model, conditions on posterior samples,
-    and compiles a function that takes new input values (scalars or arrays).
-
-    Parameters
-    ----------
-    model : pm.Model
-        The fitted PyMC model
-    inference_data : InferenceData
-        ArviZ InferenceData with posterior samples
-    response_exprs : dict[str, expr_spec]
-        Mapping from output names to one of:
-        - TensorVariable: raw model expression
-        - str: name of model variable (e.g., "direct_saturated")
-        - tuple (expr, post_fn): expr is TensorVariable/str, post_fn is applied 
-          after vectorization. post_fn takes vectorized output (n_samples, n_points)
-          and returns transformed output (e.g., lambda x: x.mean(axis=0))
-    input_vars : list of str
-        Names of data variables to use as inputs (e.g., ["spend_direct", "spend_upper"])
-    n_samples : int
-        Number of posterior samples to use
-
-    Returns
-    -------
-    predict_fn : callable
-        Function(**inputs) -> dict of responses
-        Inputs can be scalars or 1D arrays (will be broadcast to same length).
-    compiled_fn : pytensor.function
-        The underlying compiled pytensor function
-    """
-    # Extract posterior samples using arviz (handles chain flattening + sampling)
-    _posterior = az.extract(inference_data, num_samples=n_samples).transpose("sample", ...)
-
-    # Process response expressions: convert strings to model variables, extract post_fns
-    _output_names = list(response_exprs.keys())
-    _outputs = []
-    _post_fns = []
-    for name, expr_spec in response_exprs.items():
-        # Handle tuple (expr, post_fn) format
-        if isinstance(expr_spec, tuple):
-            expr, post_fn = expr_spec
-        else:
-            expr, post_fn = expr_spec, None
-
-        # Convert string to model variable
-        if isinstance(expr, str):
-            _outputs.append(model[expr])
-        else:
-            _outputs.append(expr)
-        _post_fns.append(post_fn)
-
-    # Find which free RVs are needed for these outputs
-    _free_rvs = set(model.free_RVs)
-    _needed_rvs = [rv for rv in ancestors(_outputs, blockers=_free_rvs) if rv in _free_rvs]
-
-    # Create placeholder tensors for RVs (same shape, will be vectorized later)
-    _rv_placeholders = {
-        rv: pt.tensor(name=rv.name, shape=rv.type.shape, dtype=rv.dtype)
-        for rv in _needed_rvs
-    }
-
-    # Find data variables using ancestors - more robust than graph_inputs name matching
-    # Get ALL ancestors of outputs, then find which ones are model data variables
-    _all_ancestors = set(ancestors(_outputs))
-    _data_vars_in_graph = {}
-    for name in input_vars:
-        # Get the data variable from model.named_vars (SharedVariable)
-        model_var = model.named_vars.get(name)
-        if model_var is not None and model_var in _all_ancestors:
-            _data_vars_in_graph[name] = model_var
-
-    # Create symbolic inputs for each data variable (vectors to match model's data shape)
-    _symbolic_inputs = {
-        name: pt.vector(f"{name}_in", dtype="float64")
-        for name in input_vars
-    }
-
-    # Build replacement dict for data variables
-    _data_replacements = {
-        _data_vars_in_graph[name]: _symbolic_inputs[name]
-        for name in input_vars
-        if name in _data_vars_in_graph
-    }
-
-    # Clone graph, replacing RVs with placeholders and data with symbolic inputs
-    _all_replacements = {**_rv_placeholders, **_data_replacements}
-    _cloned_outputs = clone_replace(_outputs, replace=_all_replacements)
-
-    # Cleanup graph
-    _cloned_outputs = [
-        rewrite_graph(out, include=("canonicalize", "ShapeOpt"))
-        for out in _cloned_outputs
-    ]
-
-    # Replace placeholders with actual posterior samples and vectorize
-    _sample_replacements = {
-        placeholder: pt.constant(
-            _posterior[placeholder.name].values.astype(placeholder.dtype),
-            name=placeholder.name,
-        )
-        for placeholder in _rv_placeholders.values()
-    }
-
-    _vectorized_outputs = [
-        vectorize_graph(out, replace=_sample_replacements)
-        for out in _cloned_outputs
-    ]
-
-    # Final cleanup
-    _vectorized_outputs = [
-        rewrite_graph(out, include=(
-            "useless",
-            "local_eager_useless_unbatched_blockwise",
-            "local_useless_unbatched_blockwise",
-        ))
-        for out in _vectorized_outputs
-    ]
-
-    # Apply post-processing functions (e.g., mean, percentile) to vectorized outputs
-    _final_outputs = [
-        post_fn(out) if post_fn is not None else out
-        for out, post_fn in zip(_vectorized_outputs, _post_fns)
-    ]
-
-    # Compile the pytensor function (inputs in order of input_vars)
-    _ordered_inputs = [_symbolic_inputs[name] for name in input_vars]
-    _compiled_fn = pytensor.function(
-        inputs=_ordered_inputs,
-        outputs=_final_outputs,
-        on_unused_input='ignore',
-    )
-
-    def predict_fn(**kwargs):
-        """
-        Compute response variables at given input values.
-
-        Parameters
-        ----------
-        **kwargs : float or array-like
-            Input values keyed by input variable name.
-            Can be scalars or 1D arrays - will be broadcast to same length.
-
-        Returns
-        -------
-        responses : dict
-            Keys: response expression names
-            Values: arrays with shape depending on post_fn applied
-        """
-        # Convert inputs to arrays and broadcast to same length
-        _arrays = {name: np.atleast_1d(kwargs[name]) for name in input_vars}
-        _max_len = max(len(arr) for arr in _arrays.values())
-        _input_arrays = [
-            np.broadcast_to(_arrays[name], (_max_len,)).astype(np.float64)
-            for name in input_vars
-        ]
-
-        _results = _compiled_fn(*_input_arrays)
-
-        return {
-            name: result
-            for name, result in zip(_output_names, _results)
-        }
-
-    return predict_fn, _compiled_fn
-
-
-@app.function
 def create_saturation_predictor(model, inference_data, n_samples=200, include_hdi=False):
     """
     Create a compiled pytensor function for saturation curve predictions.
 
-    Convenience wrapper around create_posterior_predictor for computing
+    Convenience wrapper around create_frozen_predictor for computing
     beta * saturation effects for each channel.
 
     Parameters
@@ -1206,8 +1034,6 @@ def create_saturation_predictor(model, inference_data, n_samples=200, include_hd
     predict_fn : callable
         Function(spend_direct, spend_upper, spend_lower) -> dict of effects
         Inputs can be scalars or arrays (broadcast to same length).
-    compiled_fn : pytensor.function
-        The underlying compiled pytensor function
     """
     _input_vars = ["spend_direct", "spend_upper", "spend_lower"]
 
@@ -1243,12 +1069,12 @@ def create_saturation_predictor(model, inference_data, n_samples=200, include_hd
         _response_exprs['lower_high'] = (_lower_expr, _high_fn)
 
     # Use the general predictor
-    _general_predict_fn, _compiled_fn = create_posterior_predictor(
+    _general_predict_fn = create_frozen_predictor(
         model=model,
         inference_data=inference_data,
         response_exprs=_response_exprs,
         input_vars=_input_vars,
-        n_samples=n_samples,
+        num_samples=n_samples,
     )
 
     def predict_fn(spend_direct, spend_upper, spend_lower):
@@ -1272,7 +1098,7 @@ def create_saturation_predictor(model, inference_data, n_samples=200, include_hd
             spend_lower=spend_lower,
         )
 
-    return predict_fn, _compiled_fn
+    return predict_fn
 
 
 @app.function
@@ -1298,8 +1124,6 @@ def create_response_predictor(model, inference_data, n_samples=200, include_hdi=
     -------
     predict_fn : callable
         Function(spend_direct, spend_upper, spend_lower) -> dict of total effects
-    compiled_fn : pytensor.function
-        The underlying compiled pytensor function
     """
     _input_vars = ["spend_direct", "spend_upper", "spend_lower"]
 
@@ -1329,12 +1153,12 @@ def create_response_predictor(model, inference_data, n_samples=200, include_hdi=
         _response_exprs['lower_high'] = ("total_lower_effect", _high_fn)
 
     # Use the general predictor
-    _general_predict_fn, _compiled_fn = create_posterior_predictor(
+    _general_predict_fn = create_frozen_predictor(
         model=model,
         inference_data=inference_data,
         response_exprs=_response_exprs,
         input_vars=_input_vars,
-        n_samples=n_samples,
+        num_samples=n_samples,
     )
 
     def predict_fn(spend_direct, spend_upper, spend_lower):
@@ -1359,7 +1183,7 @@ def create_response_predictor(model, inference_data, n_samples=200, include_hdi=
             spend_lower=np.asarray(spend_lower),
         )
 
-    return predict_fn, _compiled_fn
+    return predict_fn
 
 
 @app.function
@@ -1384,8 +1208,6 @@ def create_sales_timeseries_predictor(model, inference_data, n_samples=200):
     predict_fn : callable
         Function(spend_direct, spend_upper, spend_lower) -> dict with 'mean', 'low', 'high'
         Each is a 1D array of length n_dates (time series of predicted sales)
-    compiled_fn : pytensor.function
-        The underlying compiled pytensor function
     """
     _input_vars = ["spend_direct", "spend_upper", "spend_lower"]
 
@@ -1403,12 +1225,12 @@ def create_sales_timeseries_predictor(model, inference_data, n_samples=200):
     }
 
     # Use the general predictor
-    _general_predict_fn, _compiled_fn = create_posterior_predictor(
+    _general_predict_fn = create_frozen_predictor(
         model=model,
         inference_data=inference_data,
         response_exprs=_response_exprs,
         input_vars=_input_vars,
-        n_samples=n_samples,
+        num_samples=n_samples,
     )
 
     def predict_fn(spend_direct, spend_upper, spend_lower):
