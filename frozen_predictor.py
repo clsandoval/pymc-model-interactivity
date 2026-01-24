@@ -65,17 +65,13 @@ def _find_needed_nodes(
     """
     free_rvs_set = set(model.free_RVs)
     observed_rvs_set = set(model.observed_RVs)
-    all_model_rvs = free_rvs_set | observed_rvs_set
     
-    # Find ancestors, blocking at RVs
-    ancestors_to_rvs = set(ancestors(outputs, blockers=all_model_rvs))
-    
-    # Extract needed RVs from the blockers that were reached
-    needed_free_rvs = ancestors_to_rvs & free_rvs_set
-    needed_observed_rvs = ancestors_to_rvs & observed_rvs_set
-    
-    # Full traversal for input ancestor detection and protected dims
+    # Find all ancestors of outputs (full traversal, no blocking).
     all_ancestors = set(ancestors(outputs))
+    
+    # Needed RVs are simply the intersection with the full ancestry
+    needed_free_rvs = all_ancestors & free_rvs_set
+    needed_observed_rvs = all_ancestors & observed_rvs_set
     
     # Find input variables that are actually used
     input_ancestors = {
@@ -146,16 +142,13 @@ def _replace_observed_rvs(
     model: pm.Model,
     needed_observed_rvs: list[TensorVariable],
     input_var_set: set[Variable],
-    rng_seed: int | None = None,
     has_dynamic_dims: bool = True,
-    graph_replacements: dict[Variable, Variable] | None = None,
-) -> dict[TensorVariable, Variable]:
+) -> tuple[dict[TensorVariable, Variable], dict[TensorVariable, TensorVariable]]:
     """
     Create replacement expressions for observed RVs.
     
     For input-independent observed RVs, uses the observed data as a constant.
-    For input-dependent observed RVs, uses ICDF with frozen uniform quantiles
-    to express them as deterministic functions of inputs.
+    For input-dependent observed RVs, uses ICDF with uniform placeholders.
     
     Parameters
     ----------
@@ -165,20 +158,17 @@ def _replace_observed_rvs(
         Observed RVs that need replacements.
     input_var_set : set[Variable]
         Input variables that are ancestors of outputs.
-    rng_seed : int or None
-        Random seed for reproducible ICDF sampling.
     has_dynamic_dims : bool
         Whether the input dimensions are dynamic (no protected dims).
         If True and an observed RV has fixed shape, a warning is logged.
-    graph_replacements : dict or None
-        If provided, clone the replacement expressions using these substitutions
-        (e.g., rv_placeholders and data_replacements). Returns cloned expressions.
     
     Returns
     -------
-    dict[TensorVariable, Variable]
-        Mapping from observed RVs to their replacement expressions.
-        If graph_replacements is provided, expressions are cloned with those substitutions.
+    tuple[dict, dict]
+        - replacements: Mapping from observed RVs to their replacement expressions.
+        - uniform_placeholders: Mapping from observed RVs to their uniform placeholders
+          (only for input-dependent RVs). These should be replaced with (num_samples,)
+          uniform arrays during sample vectorization.
         
     Raises
     ------
@@ -186,7 +176,7 @@ def _replace_observed_rvs(
         If ICDF is not available for an input-dependent observed RV.
     """
     replacements = {}
-    uniform_rng = np.random.default_rng(rng_seed if rng_seed not in (None, False) else 42)
+    uniform_placeholders = {}
     
     for rv in needed_observed_rvs:
         depends_on_input = bool(set(ancestors(rv.owner.inputs[2:])) & input_var_set)
@@ -200,10 +190,10 @@ def _replace_observed_rvs(
                 data_values = observed_data.eval()
             replacements[rv] = pt.constant(data_values.astype(rv.dtype), name=rv.name)
         else:
-            # Input-dependent: use ICDF with frozen uniform quantile
+            # Input-dependent: use ICDF with uniform placeholder
             logger.info(
                 f"Observed RV '{rv.name}' depends on inputs. Replacing with ICDF "
-                f"using frozen uniform quantiles for deterministic predictions."
+                f"using uniform placeholders for predictive sampling."
             )
             
             # Warn about fixed shapes only if dynamic sizing is expected
@@ -213,13 +203,12 @@ def _replace_observed_rvs(
                     f"Use 'dims' on observed RVs to allow dynamic input sizes."
                 )
             
-            frozen_uniform = uniform_rng.uniform(0, 1)
-            uniform_constant = pt.constant(
-                np.asarray(frozen_uniform, dtype=rv.dtype),
-                name=f"{rv.name}_uniform"
-            )
+            # Create a scalar placeholder for the uniform quantile
+            uniform_placeholder = pt.scalar(f"{rv.name}_uniform", dtype=rv.dtype)
+            uniform_placeholders[rv] = uniform_placeholder
+            
             try:
-                replacements[rv] = pm.icdf(rv, uniform_constant, warn_rvs=False)
+                replacements[rv] = pm.icdf(rv, uniform_placeholder, warn_rvs=False)
             except NotImplementedError as e:
                 raise NotImplementedError(
                     f"ICDF is not available for observed RV '{rv.name}' (distribution: {rv.owner.op}). "
@@ -227,12 +216,7 @@ def _replace_observed_rvs(
                     f"input-dependent observed RVs. Original error: {e}"
                 ) from e
     
-    # Clone replacements with graph_replacements if provided
-    if graph_replacements and replacements:
-        cloned_exprs = clone_replace(list(replacements.values()), replace=graph_replacements)
-        return dict(zip(replacements.keys(), cloned_exprs))
-    
-    return replacements
+    return replacements, uniform_placeholders
 
 
 def _remove_specify_shape(
@@ -505,15 +489,28 @@ def create_frozen_predictor(
         for name in input_vars
     }
     
-    # Get observed RV replacements (already cloned with graph_replacements)
-    observed_rv_replacements = _replace_observed_rvs(
-        model, needed_observed_rvs, input_var_set, rng_seed, has_dynamic_dims, {**rv_placeholders, **data_replacements}
+    # Get observed RV replacements and uniform placeholders
+    observed_rv_replacements, uniform_placeholders = _replace_observed_rvs(
+        model, needed_observed_rvs, input_var_set, has_dynamic_dims
     )
 
-    # Build complete replacement dict
-    graph_replacements = {
+    # Clone the ICDF replacement expressions to use placeholders instead of original RVs.
+    # Include uniform placeholders mapped to themselves to preserve their identity.
+    base_replacements = {
         **rv_placeholders,
         **data_replacements,
+        **{p: p for p in uniform_placeholders.values()},
+    }
+    if observed_rv_replacements:
+        cloned_icdf_exprs = clone_replace(
+            list(observed_rv_replacements.values()), 
+            replace=base_replacements
+        )
+        observed_rv_replacements = dict(zip(observed_rv_replacements.keys(), cloned_icdf_exprs))
+
+    # Build complete replacement dict and clone outputs
+    graph_replacements = {
+        **base_replacements,
         **observed_rv_replacements,
     }
     cloned_outputs = clone_replace(outputs, replace=graph_replacements)
@@ -526,6 +523,7 @@ def create_frozen_predictor(
     batched_outputs = vectorize_graph(cloned_outputs, replace=scenario_replacements)
 
     # Vectorize: add sample dimension (replace placeholders with posterior samples)
+    num_samples = posterior.sizes["sample"]
     sample_replacements = {
         placeholder: pt.constant(
             posterior[placeholder.name].values.astype(placeholder.dtype),
@@ -533,6 +531,16 @@ def create_frozen_predictor(
         )
         for placeholder in rv_placeholders.values()
     }
+    
+    # Add uniform samples for ICDF replacements (one quantile per posterior sample)
+    uniform_rng = np.random.default_rng(rng_seed if rng_seed not in (None, False) else 42)
+    for rv, uniform_placeholder in uniform_placeholders.items():
+        uniform_samples = uniform_rng.uniform(0, 1, size=num_samples).astype(uniform_placeholder.dtype)
+        sample_replacements[uniform_placeholder] = pt.constant(
+            uniform_samples,
+            name=uniform_placeholder.name,
+        )
+    
     outputs_with_samples = vectorize_graph(batched_outputs, replace=sample_replacements)
 
     # remove SpecifyShape ops (respecting protected dims)
