@@ -22,7 +22,8 @@ import numpy.typing as npt
 import pymc as pm
 import pytensor
 import pytensor.tensor as pt
-from pytensor.graph.basic import Variable, ancestors
+from pytensor.graph.basic import Variable
+from pytensor.graph.traversal import ancestors
 from pytensor.graph.replace import clone_replace, vectorize_graph
 from pytensor.tensor.shape import SpecifyShape
 from pytensor.tensor.variable import TensorVariable
