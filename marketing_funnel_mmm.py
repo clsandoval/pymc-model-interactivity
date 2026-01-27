@@ -16,10 +16,10 @@
 
 import marimo
 
-__generated_with = "0.19.4"
+__generated_with = "0.19.6"
 app = marimo.App(width="full")
 
-with app.setup(hide_code=True):
+with app.setup:
     import marimo as mo
     import numpy as np
     import pandas as pd
@@ -275,23 +275,21 @@ def _():
 
 @app.cell(hide_code=True)
 def _(fit_button, funnel_model):
-    with mo.redirect_stdout():
-    # Model fitting cell
-        if not fit_button.value:
-            mo.md("*Click 'Fit Model' to start sampling*")
-            idata = None
-        else:
-            with funnel_model:
-                idata = pm.sample(
-                    draws=500,
-                    tune=500,
-                    chains=4,
-                    random_seed=42,
-                    return_inferencedata=True,
-                    progressbar=True,
-                    nuts_sampler="numpyro"
-                )
-            mo.md("**Model fitting complete!**")
+    if not fit_button.value:
+        mo.md("*Click 'Fit Model' to start sampling*")
+        idata = None
+    else:
+        with funnel_model:
+            idata = pm.sample(
+                draws=500,
+                tune=500,
+                chains=4,
+                random_seed=42,
+                return_inferencedata=True,
+                progressbar=True,
+                nuts_sampler="numpyro"
+            )
+        mo.md("**Model fitting complete!**")
     return (idata,)
 
 
@@ -1256,16 +1254,6 @@ def create_sales_timeseries_predictor(model, inference_data, n_samples=200):
         )
 
     return predict_fn
-
-
-@app.cell
-def _():
-    return
-
-
-@app.cell
-def _():
-    return
 
 
 if __name__ == "__main__":
