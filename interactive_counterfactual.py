@@ -1,793 +1,888 @@
 # /// script
+# requires-python = ">=3.11"
 # dependencies = [
-#     "marimo>=0.19.0",
-#     "pymc>=5.10.0",
-#     "pymc-marketing>=0.17.1",
+#     "marimo",
+#     "pymc>=5.17.0,<5.18",
+#     "pymc-marketing>=0.16.0,<0.17",
 #     "arviz",
+#     "pytensor>=2.31.0,<2.32",
 #     "numpy",
 #     "pandas",
 #     "matplotlib",
-#     "pytensor",
-#     "pyzmq>=27.1.0",
-#     "jax==0.9.0",
-#     "numpyro==0.19.0",
-#     "wigglystuff>=0.2.17",
+#     "wigglystuff",
+#     "jax",
+#     "numpyro",
 # ]
 # ///
 
 import marimo
 
-__generated_with = "0.19.6"
-app = marimo.App(width="full")
+__generated_with = "0.18.1"
+app = marimo.App(width="medium")
 
-with app.setup:
+
+@app.cell
+def _():
     import marimo as mo
     import numpy as np
     import pandas as pd
     import matplotlib.pyplot as plt
-    import arviz as az
-    import pymc as pm
-    import pytensor
-    import pytensor.tensor as pt
-    from scipy.interpolate import interp1d
-    from wigglystuff import ChartPuck
-    
-    # Import components from pymc-marketing
-    from pymc_marketing.mmm.hsgp import SoftPlusHSGP
-    from pymc_marketing.mmm.transformers import geometric_adstock, hill_function
-
-    # Import local data generation
-    from generate_data import generate_marketing_funnel_data, TRUE_PARAMS
-
-    # Import posterior predictor
-    from frozen_predictor import create_frozen_predictor
+    from datetime import datetime, timedelta
+    return datetime, mo, np, pd, plt, timedelta
 
 
-@app.cell(hide_code=True)
-def _():
-    # Model Structure Diagram
-    _diagram = """
-    flowchart TD
-        subgraph Baseline[Time-Varying Baseline]
-            baseline["baseline(t)"]
-        end
+@app.cell
+def _(mo):
+    mo.md("""
+    # Interactive Counterfactual Analysis
 
-        subgraph Controls[Control Variables]
-            ctrl_effect["Inflation"]
-        end
+    This notebook provides an interactive budget allocation tool for Marketing Mix Modeling.
 
-        subgraph Direct[Direct Channel]
-            effect_direct["Spend"]
-        end
-
-        subgraph Upper[Upper Funnel Channel]
-            spend_upper["Spend"]
-        end
-
-        subgraph Lower[Lower Funnel Channel]
-            spend_upper --> CPM
-            spend_lower["Spend"] --> effect_lower
-            CPM --> effect_lower
-            effect_lower["impressions"]
-        end
-
-        baseline --> Sales
-        ctrl_effect --> Sales
-        effect_direct --> Sales
-        spend_upper --> Sales
-        effect_lower --> Sales
-    """
-
-    mo.md(f"""
-    # Interactive Counterfactual Budget Analysis
-
-    This notebook demonstrates interactive counterfactual analysis for a Marketing Mix Model.
-
-    **Features:**
-    - **Plot 1**: Interactive budget layout editor using ChartPuck - drag pucks vertically to adjust spend
-    - **Plot 2**: Counterfactual sales prediction based on confirmed budget allocation
-
-    ## Model Structure
-
-    {mo.mermaid(_diagram).text}
-
-    **Key equations:**
-    - `Sales(t) = intercept_base * baseline(t) + beta_inflation * inflation(t) + channel_effects + noise`
-    - `CPM_lower(t) = CPM_base * exp(-gamma * upper_funnel_effect(t))`
-    - `impressions_lower(t) = spend_lower(t) / CPM_lower(t)`
+    **Workflow:**
+    1. Click **Fit Model** to train the MMM on synthetic data
+    2. **Plot 1**: Select a channel and drag pucks to adjust weekly spend
+    3. Click **Confirm Budget** to lock in your budget allocation
+    4. **Plot 2**: View the counterfactual sales prediction (updates on Confirm)
     """)
     return
 
 
-@app.cell(hide_code=True)
-def _():
-    # Load synthetic data
-    df, true_params = generate_marketing_funnel_data(n_periods=104, seed=42)
-    return (df,)
+@app.cell
+def _(np, pd, timedelta):
+    # ==============================================================================
+    # TRUE PARAMETERS - Used to generate synthetic data
+    # ==============================================================================
+    TRUE_PARAMS = {
+        # Channel parameters: (adstock_alpha, saturation_lam, saturation_beta)
+        "Direct": {
+            "adstock_alpha": 0.3,  # Fast decay - direct response
+            "saturation_lam": 0.8,
+            "saturation_beta": 0.4,
+            "base_spend": 5000,
+            "spend_std": 1500,
+        },
+        "Upper_Funnel": {
+            "adstock_alpha": 0.7,  # Slow decay - brand building
+            "saturation_lam": 0.5,
+            "saturation_beta": 0.25,
+            "base_spend": 8000,
+            "spend_std": 2000,
+        },
+        "Lower_Funnel": {
+            "adstock_alpha": 0.4,  # Medium decay
+            "saturation_lam": 0.6,
+            "saturation_beta": 0.35,
+            "base_spend": 6000,
+            "spend_std": 1800,
+        },
+        # Global parameters
+        "intercept": 10000,
+        "noise_std": 500,
+        "trend_coef": 50,  # Weekly trend
+    }
+
+    def geometric_adstock(x, alpha, l_max=8):
+        """Apply geometric adstock transformation."""
+        weights = np.array([alpha**i for i in range(l_max)])
+        weights = weights / weights.sum()
+
+        result = np.zeros_like(x, dtype=float)
+        for i in range(len(x)):
+            for j, w in enumerate(weights):
+                if i - j >= 0:
+                    result[i] += w * x[i - j]
+        return result
+
+    def logistic_saturation(x, lam, beta):
+        """Apply logistic saturation transformation."""
+        return beta * (1 - np.exp(-lam * x))
+
+    def generate_marketing_funnel_data(n_weeks=104, seed=42):
+        """
+        Generate synthetic marketing data with known parameters.
+
+        Returns:
+            pd.DataFrame: Marketing data with columns for date, channels, and sales
+        """
+        np.random.seed(seed)
+
+        # Generate dates
+        start_date = pd.Timestamp("2022-01-01")
+        dates = [start_date + timedelta(weeks=i) for i in range(n_weeks)]
+
+        # Generate spend for each channel with seasonality
+        t = np.arange(n_weeks)
+        seasonality = 1 + 0.2 * np.sin(2 * np.pi * t / 52)  # Annual seasonality
+
+        channels = ["Direct", "Upper_Funnel", "Lower_Funnel"]
+        spend_data = {}
+        contributions = {}
+
+        for channel in channels:
+            params = TRUE_PARAMS[channel]
+
+            # Generate spend with seasonality and noise
+            base_spend = params["base_spend"] * seasonality
+            noise = np.random.normal(0, params["spend_std"], n_weeks)
+            spend = np.maximum(base_spend + noise, 0)  # Ensure non-negative
+            spend_data[channel] = spend
+
+            # Apply adstock
+            adstocked = geometric_adstock(spend / 1000, params["adstock_alpha"])  # Normalize spend
+
+            # Apply saturation
+            saturated = logistic_saturation(adstocked, params["saturation_lam"], params["saturation_beta"])
+
+            # Scale contribution
+            contributions[channel] = saturated * 10000
+
+        # Calculate total sales
+        intercept = TRUE_PARAMS["intercept"]
+        trend = TRUE_PARAMS["trend_coef"] * t
+        noise = np.random.normal(0, TRUE_PARAMS["noise_std"], n_weeks)
+
+        sales = (
+            intercept
+            + trend
+            + contributions["Direct"]
+            + contributions["Upper_Funnel"]
+            + contributions["Lower_Funnel"]
+            + noise
+        )
+
+        # Create DataFrame
+        df = pd.DataFrame({
+            "date_week": dates,
+            "Direct": spend_data["Direct"],
+            "Upper_Funnel": spend_data["Upper_Funnel"],
+            "Lower_Funnel": spend_data["Lower_Funnel"],
+            "sales": sales,
+        })
+
+        return df, contributions
+
+    # Generate the data
+    marketing_data, true_contributions = generate_marketing_funnel_data(n_weeks=104)
+
+    print(f"Generated {len(marketing_data)} weeks of synthetic marketing data")
+    print(f"Channels: {['Direct', 'Upper_Funnel', 'Lower_Funnel']}")
+    print(f"Date range: {marketing_data['date_week'].min()} to {marketing_data['date_week'].max()}")
+    return (
+        TRUE_PARAMS,
+        generate_marketing_funnel_data,
+        geometric_adstock,
+        logistic_saturation,
+        marketing_data,
+        true_contributions,
+    )
 
 
-@app.cell(hide_code=True)
-def _(df):
-    # Data Visualization
-    _fig, _axes = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
+@app.cell
+def _(marketing_data, mo, plt, true_contributions):
+    # Visualize the generated data
+    fig_data, axes_data = plt.subplots(2, 1, figsize=(12, 8))
 
-    # Plot media spends
-    _axes[0].plot(df["date"], df["spend_direct"], label="Direct", alpha=0.8)
-    _axes[0].plot(df["date"], df["spend_upper"], label="Upper Funnel", alpha=0.8)
-    _axes[0].plot(df["date"], df["spend_lower"], label="Lower Funnel", alpha=0.8)
-    _axes[0].set_ylabel("Spend")
-    _axes[0].legend()
-    _axes[0].set_title("Media Spends Over Time")
+    # Plot spend over time
+    ax1 = axes_data[0]
+    for channel in ["Direct", "Upper_Funnel", "Lower_Funnel"]:
+        ax1.plot(marketing_data["date_week"], marketing_data[channel], label=channel, alpha=0.8)
+    ax1.set_xlabel("Date")
+    ax1.set_ylabel("Spend ($)")
+    ax1.set_title("Marketing Spend by Channel Over Time")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
 
-    # Plot inflation
-    _axes[1].plot(df["date"], df["inflation"], color="orange", alpha=0.8)
-    _axes[1].axhline(0, color="gray", linestyle="--", alpha=0.5)
-    _axes[1].set_ylabel("Inflation (deviation)")
-    _axes[1].set_title("Inflation Control Variable")
-
-    # Plot sales
-    _axes[2].plot(df["date"], df["sales"], color="green", alpha=0.8)
-    _axes[2].plot(df["date"], df["baseline_true"], color="gray", linestyle="--", 
-                  alpha=0.5, label="True baseline")
-    _axes[2].set_ylabel("Sales")
-    _axes[2].set_xlabel("Date")
-    _axes[2].set_title("Sales Over Time")
-    _axes[2].legend()
+    # Plot sales and contributions
+    ax2 = axes_data[1]
+    ax2.plot(marketing_data["date_week"], marketing_data["sales"], label="Total Sales", color="black", linewidth=2)
+    for channel, contrib in true_contributions.items():
+        ax2.fill_between(marketing_data["date_week"], 0, contrib, alpha=0.3, label=f"{channel} Contribution")
+    ax2.set_xlabel("Date")
+    ax2.set_ylabel("Sales / Contribution")
+    ax2.set_title("Sales and Channel Contributions (True)")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
 
     plt.tight_layout()
 
-    plt.gca()
+    mo.md("## Generated Synthetic Data")
+    return ax1, ax2, axes_data, fig_data
+
+
+@app.cell
+def _(axes_data):
+    # Display the data visualization
+    axes_data[0].figure
     return
 
 
-@app.cell(hide_code=True)
-def _(df):
-    # Model Definition
-    # Using pymc-marketing's built-in transformers:
-    # - hill_function(x, slope, kappa) for saturation
-    # - geometric_adstock(x, alpha, l_max, normalize) for carry-over effects
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+    ## Model Fitting
 
-    # Prepare data
-    n_obs = len(df)
-    t_idx = np.arange(n_obs)
+    Click the button below to fit the MMM model using PyMC-Marketing with the numpyro sampler.
 
-    # Normalize spends for saturation
-    spend_direct_data = df["spend_direct"].values / 100.0
-    spend_upper_data = df["spend_upper"].values / 100.0
-    spend_lower_data = df["spend_lower"].values / 100.0
-    inflation_data = df["inflation"].values
-    sales_data = df["sales"].values
-
-    l_max = 8  # Maximum adstock lag
-
-    # Build the model
-    # Configure HSGP from data (automatically sets good defaults for priors)
-    hsgp = SoftPlusHSGP.parameterize_from_data(X=t_idx, dims="date")
-
-    with pm.Model(coords={"date": df["date"].values}) as funnel_model:
-        # === Data inputs ===
-        spend_direct = pm.Data("spend_direct", spend_direct_data, dims="date")
-        spend_upper = pm.Data("spend_upper", spend_upper_data, dims="date")
-        spend_lower = pm.Data("spend_lower", spend_lower_data, dims="date")
-        inflation = pm.Data("inflation", inflation_data, dims="date")
-
-        # === Time-varying intercept using SoftPlusHSGP ===
-        intercept_base = pm.HalfNormal("intercept_base", sigma=500)
-
-        # HSGP for time-varying component (normalized to mean ~1)
-        # parameterize_from_data sets up appropriate priors based on data scale
-        time_data = pm.Data("time_idx", t_idx, dims="date")
-        baseline_gp = hsgp.register_data(time_data).create_variable("baseline_gp")
-
-        baseline = pm.Deterministic("baseline", intercept_base * baseline_gp, dims="date")
-
-        # === Control variable ===
-        beta_inflation = pm.Normal("beta_inflation", mu=0, sigma=50)
-        control_effect = beta_inflation * inflation
-
-        # === Direct channel ===
-        slope_direct = pm.Normal("slope_direct", mu=2, sigma=0.5)
-        kappa_direct = pm.Beta("kappa_direct", alpha=8, beta=8)
-        alpha_direct = pm.Beta("alpha_direct", alpha=8, beta=8)
-        beta_direct = pm.Normal("beta_direct", mu=200, sigma=50)
-
-        # Store saturation as Deterministic for later extraction
-        direct_saturated = pm.Deterministic(
-            "direct_saturated",
-            hill_function(spend_direct, slope_direct, kappa_direct),
-            dims="date"
-        )
-        direct_adstocked = geometric_adstock(direct_saturated, alpha=alpha_direct, l_max=l_max, normalize=True)
-        direct_effect = pm.Deterministic("direct_effect", beta_direct * direct_adstocked, dims="date")
-
-        # === Upper funnel channel ===
-        slope_upper = pm.Normal("slope_upper", mu=2, sigma=0.5)
-        kappa_upper = pm.Beta("kappa_upper", alpha=8, beta=8)
-        alpha_upper = pm.Beta("alpha_upper", alpha=8, beta=8)
-        beta_upper = pm.Normal("beta_upper", mu=200, sigma=50)
-
-        # Store saturation as Deterministic
-        upper_saturated = pm.Deterministic(
-            "upper_saturated",
-            hill_function(spend_upper, slope_upper, kappa_upper),
-            dims="date"
-        )
-        upper_adstocked = geometric_adstock(upper_saturated, alpha=alpha_upper, l_max=l_max, normalize=True)
-        upper_effect = pm.Deterministic("upper_effect", beta_upper * upper_adstocked, dims="date")
-
-        # === Funnel interaction: upper funnel affects lower funnel CPM ===
-        cpm_base = pm.Normal("cpm_base", mu=10, sigma=3)
-        gamma = pm.HalfNormal("gamma", sigma=1)
-
-        # CPM decreases with upper funnel activity (uses saturation, not adstocked for instant response)
-        # For saturation curves, we want CPM based on saturation level
-        cpm_lower = pm.Deterministic(
-            "cpm_lower", 
-            cpm_base * pt.exp(-gamma * upper_saturated),
-            dims="date"
-        )
-
-        # === Lower funnel channel (impressions-based) ===
-        # impressions = spend / CPM
-        impressions_lower = spend_lower * 1000.0 / cpm_lower  # Un-normalize spend for division
-        impressions_norm = impressions_lower / 100.0  # Normalize impressions
-
-        slope_lower = pm.Normal("slope_lower", mu=2, sigma=0.5)
-        kappa_lower = pm.Beta("kappa_lower", alpha=8, beta=8)
-        alpha_lower = pm.Beta("alpha_lower", alpha=8, beta=8)
-        beta_lower = pm.Normal("beta_lower", mu=200, sigma=50)
-
-        # Store saturation as Deterministic
-        lower_saturated = pm.Deterministic(
-            "lower_saturated",
-            hill_function(impressions_norm, slope_lower, kappa_lower),
-            dims="date"
-        )
-        lower_adstocked = geometric_adstock(lower_saturated, alpha=alpha_lower, l_max=l_max, normalize=True)
-        lower_effect = pm.Deterministic("lower_effect", beta_lower * lower_adstocked, dims="date")
-
-        # === Total effects (sum over dates) for response curves ===
-        total_direct_effect = pm.Deterministic("total_direct_effect", direct_effect.sum())
-        total_upper_effect = pm.Deterministic("total_upper_effect", upper_effect.sum())
-        total_lower_effect = pm.Deterministic("total_lower_effect", lower_effect.sum())
-
-        # === Total prediction ===
-        mu = pm.Deterministic(
-            "mu",
-            baseline + control_effect + direct_effect + upper_effect + lower_effect
-        )
-
-        # === Likelihood ===
-        sigma = pm.HalfNormal("sigma", sigma=100)
-        sales_obs = pm.Normal("sales", mu=mu, sigma=sigma, observed=sales_data)
-    funnel_model
-    return (funnel_model,)
+    **Note:** This uses reduced sampling parameters (300 draws, 300 tune, 4 chains) for faster execution.
+    """)
+    return
 
 
-@app.cell(hide_code=True)
-def _():
-    # Model fitting controls
-    fit_button = mo.ui.run_button(label="Fit Model (this may take a few minutes)")
-
-    mo.vstack([
-        mo.md("## Model Fitting"),
-        mo.md("Click the button below to start MCMC sampling. This typically takes 2-5 minutes."),
-        fit_button,
-    ])
+@app.cell
+def _(mo):
+    # Fit model button
+    fit_button = mo.ui.run_button(label="🔧 Fit Model", kind="success")
+    fit_button
     return (fit_button,)
 
 
-@app.cell(hide_code=True)
-def _(fit_button, funnel_model):
-    if not fit_button.value:
-        mo.md("*Click 'Fit Model' to start sampling*")
-        idata = None
-    else:
-        with funnel_model:
-            idata = pm.sample(
-                draws=500,
-                tune=500,
-                chains=4,
-                random_seed=42,
-                return_inferencedata=True,
-                progressbar=True,
-                nuts_sampler="numpyro"
-            )
-        mo.md("**Model fitting complete!**")
-    return (idata,)
-
-
-@app.cell(hide_code=True)
-def _(idata):
-    convergence_summary = None
-    if idata:
-        # Convergence summary (numerical check)
-        convergence_summary = az.summary(idata, var_names=[
-            "intercept_base", "beta_inflation",
-            "beta_direct", "slope_direct", "kappa_direct", "alpha_direct",
-            "beta_upper", "slope_upper", "kappa_upper", "alpha_upper",
-            "beta_lower", "slope_lower", "kappa_lower", "alpha_lower",
-            "cpm_base", "gamma", "sigma"
-        ])
-    return (convergence_summary,)
-
-
-@app.cell(hide_code=True)
-def _():
-    # Trace plot controls
-    trace_plot_control = mo.ui.radio(
-        options={"Hide":False, "Show": True},
-        value="Hide",
-        label="Show convergence diagnostics"
-    )
-    trace_plot_control
-    return (trace_plot_control,)
-
-
-@app.cell(hide_code=True)
-def _(convergence_summary, trace_plot_control):
-    _out = None
-    if convergence_summary is not None:
-        _max_rhat = convergence_summary["r_hat"].max()
-        _min_ess = convergence_summary["ess_bulk"].min()
-
-        if _max_rhat < 1.01:
-            _status = mo.md(f"**Status: All parameters converged** (max R-hat = {_max_rhat:.4f}, min ESS = {_min_ess:.0f})")
-        else:
-            _problematic = convergence_summary[convergence_summary["r_hat"] >= 1.01].index.tolist()
-            _status = mo.md(f"**Warning: Some parameters may not have converged**\n\nmax R-hat = {_max_rhat:.4f}. Check: {_problematic}")
-
-        if trace_plot_control.value:
-            _out = mo.vstack([
-                mo.md("## Convergence Diagnostics"),
-                _status,
-                mo.md("### Parameter Summary"),
-                mo.ui.table(convergence_summary.reset_index().rename(columns={"index": "parameter"})),
-            ])
-        else:
-            _out = mo.md(f"{_status}\n\n*Select 'Show convergence diagnostics' above to display diagnostics*")
-    _out
-    return
-
-
-@app.cell(hide_code=True)
-def _(idata, trace_plot_control):
-    # Conditional trace plots
-    if not idata:
-        _out = mo.md("*Click 'Fit Model' to start sampling*")
-    else:
-        _out = mo.md("*Select 'Show convergence diagnostics' above to display trace plots*")    
-        if trace_plot_control.value:
-            _fig = plt.figure(figsize=(14, 20))
-            az.plot_trace(
-                idata, 
-                var_names=[
-                    "intercept_base", "beta_inflation",
-                    "beta_direct", "alpha_direct",
-                    "beta_upper", "alpha_upper",
-                    "beta_lower", "alpha_lower",
-                    "cpm_base", "gamma", "sigma"
-                ],
-                figsize=(14, 20),
-            )
-            _out = mo.vstack([
-                mo.md("### Trace Plots"),
-                plt.gcf(),
-            ])
-    _out  
-    return
-
-
 @app.cell
-def _(funnel_model, idata):
-    # Create compiled pytensor predictor for sales time series
-    if idata:
-        sales_timeseries_predictor = create_sales_timeseries_predictor(
-            funnel_model, idata, n_samples=500
+def _(fit_button, marketing_data, mo, pd):
+    # Import PyMC-Marketing components
+    from pymc_marketing.mmm import MMM, GeometricAdstock, LogisticSaturation
+
+    # Initialize model state
+    mmm_model = None
+    model_fitted = False
+
+    if fit_button.value:
+        mo.output.append(mo.md("⏳ **Fitting model... this may take a few minutes.**"))
+
+        # Prepare data
+        date_column = "date_week"
+        channel_columns = ["Direct", "Upper_Funnel", "Lower_Funnel"]
+        target_column = "sales"
+
+        # Ensure date column is datetime
+        df_model = marketing_data.copy()
+        df_model[date_column] = pd.to_datetime(df_model[date_column])
+
+        # Create X and y
+        X = df_model[[date_column] + channel_columns]
+        y = df_model[target_column].values
+
+        # Initialize the MMM model
+        mmm_model = MMM(
+            date_column=date_column,
+            channel_columns=channel_columns,
+            adstock=GeometricAdstock(l_max=8),
+            saturation=LogisticSaturation(),
+            validate_data=True,
         )
+
+        # Fit the model with numpyro sampler (faster)
+        mmm_model.fit(
+            X=X,
+            y=y,
+            target_accept=0.9,
+            draws=300,
+            tune=300,
+            chains=4,
+            nuts_sampler="numpyro",
+            random_seed=42,
+        )
+
+        # Sample posterior predictive
+        mmm_model.sample_posterior_predictive(
+            X_pred=mmm_model.X,
+            extend_idata=True,
+            combined=True,
+        )
+
+        model_fitted = True
+        mo.output.append(mo.md("✅ **Model fitted successfully!**"))
+
+    mmm_model, model_fitted
+    return (
+        GeometricAdstock,
+        LogisticSaturation,
+        MMM,
+        mmm_model,
+        model_fitted,
+    )
+
+
+@app.cell
+def _(mmm_model, mo, model_fitted):
+    # Show model summary if fitted
+    if model_fitted and mmm_model is not None:
+        import arviz as az
+
+        _summary = az.summary(
+            mmm_model.idata,
+            var_names=["intercept", "adstock_alpha", "saturation_lam", "saturation_beta"],
+        )
+
+        _result = mo.md(f"""
+        ### Model Summary
+
+        The model has been fitted with the following posterior estimates:
+
+        {_summary.to_markdown()}
+        """)
     else:
-        sales_timeseries_predictor = None
-    return (sales_timeseries_predictor,)
+        _result = mo.md("*Model not yet fitted. Click 'Fit Model' above to train the MMM.*")
 
-
-# ============================================================================
-# INTERACTIVE COUNTERFACTUAL ANALYSIS
-# ============================================================================
-
-@app.cell
-def _(df):
-    # Initialize budget state with historical values
-    # This stores the confirmed budget allocation for all channels
-    
-    # Get historical spend values (normalized)
-    historical_spend = {
-        'direct': df["spend_direct"].values / 100.0,
-        'upper': df["spend_upper"].values / 100.0,
-        'lower': df["spend_lower"].values / 100.0,
-    }
-    
-    # State to track confirmed budget (starts with historical values)
-    get_budget_state, set_budget_state = mo.state({
-        'direct': historical_spend['direct'].copy(),
-        'upper': historical_spend['upper'].copy(),
-        'lower': historical_spend['lower'].copy(),
-    })
-    
-    return historical_spend, get_budget_state, set_budget_state
+    _result
+    return
 
 
 @app.cell
-def _():
-    # Channel selector for interactive editing
-    budget_channel_selector = mo.ui.dropdown(
-        options={"Direct Channel": "direct", "Upper Funnel": "upper", "Lower Funnel": "lower"},
-        value="Direct Channel",
-        label="Select channel to edit:"
-    )
-    
-    return (budget_channel_selector,)
+def _(mo):
+    mo.md("""
+    ---
+    ## Plot 1: Interactive Budget Layout Editor
+
+    **Instructions:**
+    - Select a channel from the dropdown to edit its spend
+    - Drag the pucks **vertically** to adjust weekly spend values (x-position is fixed)
+    - Non-selected channels are shown in gray (non-interactive)
+    - Click **Confirm Budget** to save your budget layout
+    - Click **Reset Channels** to restore all channels to historical values
+    """)
+    return
 
 
 @app.cell
-def _(budget_channel_selector, df, get_budget_state, historical_spend, set_budget_state):
-    # Interactive Budget Layout Editor using ChartPuck
-    # - Shows all channels, but only the selected one is editable
-    # - Non-selected channels are gray and transparent
-    # - Pucks constrained to vertical movement only (fixed x positions)
-    
-    mo.stop(
-        sales_timeseries_predictor is None,
-        mo.md("*Click 'Fit Model' above to enable interactive analysis*")
+def _(mo):
+    # Channel selector dropdown
+    channels_list = ["Direct", "Upper_Funnel", "Lower_Funnel"]
+    channel_selector = mo.ui.dropdown(
+        options=channels_list,
+        value=channels_list[0],
+        label="Select Channel to Edit"
     )
-    
-    _selected_channel = budget_channel_selector.value
-    _current_budget = get_budget_state()
-    _n_periods = len(df)
-    
-    # Subsample weeks for puck placement (every 4th week for usability)
-    _puck_step = 4
-    _puck_indices = list(range(0, _n_periods, _puck_step))
-    _n_pucks = len(_puck_indices)
-    
-    # Channel colors
-    _channel_colors = {
-        'direct': '#1f77b4',
-        'upper': '#ff7f0e', 
-        'lower': '#2ca02c',
-    }
-    
-    # Get the current puck y-values for the selected channel
-    _puck_y_values = [_current_budget[_selected_channel][i] * 100.0 for i in _puck_indices]
-    _puck_x_values = list(_puck_indices)  # Fixed x positions (week indices)
-    
-    # Max spend for y-axis scaling
-    _max_spend = max(
-        historical_spend['direct'].max(),
-        historical_spend['upper'].max(),
-        historical_spend['lower'].max(),
-    ) * 100.0 * 1.5  # 50% headroom
-    
-    def draw_budget_editor(ax, widget):
-        """Draw the budget editor chart with all channels visible."""
-        # Get puck positions (y values may have changed, x stays fixed)
-        puck_y = list(widget.y)
-        
-        # Channel properties
-        channels = {
-            'direct': {'color': '#1f77b4', 'label': 'Direct Channel'},
-            'upper': {'color': '#ff7f0e', 'label': 'Upper Funnel'},
-            'lower': {'color': '#2ca02c', 'label': 'Lower Funnel'},
-        }
-        
-        selected = _selected_channel
-        
-        # Plot each channel
-        for ch, props in channels.items():
-            is_selected = (ch == selected)
-            
-            if is_selected:
-                # Interpolate from puck positions to full time series
-                puck_x = _puck_indices
-                interp_fn = interp1d(puck_x, puck_y, kind='linear', 
-                                     bounds_error=False, fill_value='extrapolate')
-                full_y = interp_fn(np.arange(_n_periods))
-                
-                # Plot with full color
-                ax.plot(range(_n_periods), full_y, 
-                       color=props['color'], linewidth=2.5, alpha=1.0,
-                       label=f"{props['label']} (editing)")
-            else:
-                # Plot non-selected channels as gray and transparent
-                full_y = _current_budget[ch] * 100.0
-                ax.plot(range(_n_periods), full_y,
-                       color='gray', linewidth=1.5, alpha=0.3,
-                       label=props['label'])
-        
-        # Styling
-        ax.set_xlim(-2, _n_periods + 2)
-        ax.set_ylim(0, _max_spend)
-        ax.set_xlabel('Week')
-        ax.set_ylabel('Spend (normalized × 100)')
-        ax.set_title(f'Budget Layout Editor - Editing: {channels[selected]["label"]}')
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-    
-    # Create ChartPuck with vertical-only constraint
-    # The pucks are placed at fixed x positions (week indices)
-    budget_puck = ChartPuck.from_callback(
-        draw_fn=draw_budget_editor,
-        x_bounds=(0, _n_periods),
-        y_bounds=(0, _max_spend),
-        figsize=(14, 5),
-        x=_puck_x_values,
-        y=_puck_y_values,
-        puck_color=_channel_colors[_selected_channel],
-        puck_radius=8,
-        drag_x_bounds=(None, None),  # Allow x drag (we'll ignore it in the draw function)
-    )
-    
-    budget_widget = mo.ui.anywidget(budget_puck)
-    
-    return (budget_widget, _puck_indices, _n_periods, _max_spend)
+    channel_selector
+    return channel_selector, channels_list
 
 
 @app.cell
-def _(budget_channel_selector, budget_widget, get_budget_state, historical_spend, set_budget_state, _puck_indices, _n_periods):
-    # Confirm and Reset buttons
-    
-    def on_confirm_click(_):
-        """Lock in the current puck positions as the confirmed budget."""
-        _selected = budget_channel_selector.value
-        _current = get_budget_state()
-        
-        # Get current puck y-values
-        puck_y = list(budget_widget.y)
-        
-        # Interpolate to full time series
-        interp_fn = interp1d(_puck_indices, puck_y, kind='linear',
-                            bounds_error=False, fill_value='extrapolate')
-        full_spend = interp_fn(np.arange(_n_periods)) / 100.0  # Un-normalize
-        full_spend = np.clip(full_spend, 0, None)  # Ensure non-negative
-        
-        # Update state
-        new_budget = {**_current}
-        new_budget[_selected] = full_spend
-        set_budget_state(new_budget)
-    
-    def on_reset_click(_):
-        """Reset ALL channels to historical values."""
-        set_budget_state({
-            'direct': historical_spend['direct'].copy(),
-            'upper': historical_spend['upper'].copy(),
-            'lower': historical_spend['lower'].copy(),
-        })
-    
-    confirm_button = mo.ui.button(
-        label="✓ Confirm Budget",
-        on_click=on_confirm_click,
-        kind="success"
+def _(marketing_data, np):
+    # Configuration for the interactive planner
+    n_weeks_plan = 52  # First year for planning
+    subsample_step = 4  # Show every 4th week (~26 pucks)
+    subsample_indices = list(range(0, n_weeks_plan, subsample_step))
+    n_pucks = len(subsample_indices)
+
+    # Store ORIGINAL x positions - these are fixed week indices
+    original_x = np.array(subsample_indices, dtype=float)
+
+    # Get historical spend data for all channels
+    channels = ["Direct", "Upper_Funnel", "Lower_Funnel"]
+    historical_spend = {}
+    for _channel in channels:
+        historical_spend[_channel] = marketing_data[_channel].values[:n_weeks_plan].copy()
+
+    # Get TRUE historical sales
+    historical_sales = marketing_data["sales"].values[:n_weeks_plan].copy()
+
+    # Get dates for the planning period
+    planning_dates = marketing_data["date_week"].values[:n_weeks_plan]
+
+    # Calculate spend range for scaling
+    all_spend_values = []
+    for _ch in channels:
+        all_spend_values.extend(historical_spend[_ch])
+    max_spend = max(all_spend_values) * 1.5
+    min_spend = 0
+
+    print(f"Planning horizon: {n_weeks_plan} weeks")
+    print(f"Interactive pucks: {n_pucks} (every {subsample_step} weeks)")
+    print(f"Spend range: {min_spend:.0f} to {max_spend:.0f}")
+    return (
+        all_spend_values,
+        channels,
+        historical_sales,
+        historical_spend,
+        max_spend,
+        min_spend,
+        n_pucks,
+        n_weeks_plan,
+        original_x,
+        planning_dates,
+        subsample_indices,
+        subsample_step,
     )
-    
-    reset_button = mo.ui.button(
-        label="↺ Reset All Channels",
-        on_click=on_reset_click,
-        kind="warn"
-    )
-    
+
+
+@app.cell
+def _(mo):
+    # State management buttons
+    confirm_button = mo.ui.run_button(label="✓ Confirm Budget", kind="success")
+    reset_button = mo.ui.run_button(label="↺ Reset Channels", kind="danger")
+
+    mo.hstack([confirm_button, reset_button], justify="start", gap=1)
     return confirm_button, reset_button
 
 
 @app.cell
-def _(budget_channel_selector, budget_widget, confirm_button, reset_button):
-    # Display Plot 1: Interactive Budget Editor
-    mo.vstack([
-        mo.md("## Plot 1: Interactive Budget Layout Editor"),
-        mo.md("""
-        **Instructions:**
-        - Select a channel from the dropdown to edit its spend pattern
-        - Drag pucks **vertically** to adjust spend at that time point
-        - Non-selected channels are shown in gray (read-only)
-        - Click **Confirm Budget** to lock in your changes
-        - Click **Reset All Channels** to restore historical values
-        """),
-        mo.hstack([budget_channel_selector, confirm_button, reset_button], gap=2),
+def _(
+    channel_selector,
+    channels,
+    historical_spend,
+    max_spend,
+    min_spend,
+    mo,
+    n_weeks_plan,
+    np,
+    original_x,
+    plt,
+    subsample_indices,
+):
+    from wigglystuff import ChartPuck
+
+    # Get the currently selected channel
+    selected_channel = channel_selector.value
+
+    # Initialize spend at subsample indices for all channels
+    def get_initial_channel_spend():
+        """Create initial spend dictionary from historical values."""
+        spend_dict = {}
+        for _ch in channels:
+            spend_dict[_ch] = np.array([historical_spend[_ch][i] for i in subsample_indices])
+        return spend_dict
+
+    _initial_channel_spend = get_initial_channel_spend()
+    _selected_spend = _initial_channel_spend[selected_channel]
+
+    # Color palette for channels
+    _channel_colors = {
+        "Direct": "#e63946",       # Red
+        "Upper_Funnel": "#2a9d8f", # Teal
+        "Lower_Funnel": "#e9c46a", # Yellow
+    }
+
+    def draw_multi_channel_budget(ax, widget):
+        """
+        Draw multi-channel budget editor.
+        - Selected channel: interactive, colored, uses puck values
+        - Other channels: gray, transparent, uses historical values
+        - X positions are FIXED (vertical-only movement)
+        """
+        ax.clear()
+
+        # Get current puck Y positions (spend values) - IGNORE widget.x
+        snapped_x = original_x.copy()  # Always use original x positions
+        current_y = np.array(list(widget.y))
+        current_y = np.clip(current_y, min_spend, max_spend)
+
+        # Draw all channels
+        for ch in channels:
+            ch_spend = _initial_channel_spend[ch]
+
+            if ch == selected_channel:
+                # SELECTED CHANNEL: Use puck Y values, full color
+                color = _channel_colors[ch]
+                alpha = 1.0
+                linewidth = 2.5
+                marker_size = 120
+                spend_to_plot = current_y
+                zorder = 10
+                label = f'{ch} (editing)'
+            else:
+                # NON-SELECTED: Use historical, gray, 30% transparent
+                color = 'gray'
+                alpha = 0.3
+                linewidth = 1.5
+                marker_size = 40
+                spend_to_plot = ch_spend
+                zorder = 1
+                label = ch
+
+            # Draw line connecting points
+            if len(snapped_x) > 1:
+                x_smooth = np.linspace(snapped_x.min(), snapped_x.max(), 100)
+                y_smooth = np.interp(x_smooth, snapped_x, spend_to_plot)
+                ax.plot(x_smooth, y_smooth, color=color, alpha=alpha * 0.7,
+                       linewidth=linewidth, label=label)
+
+            # Draw markers
+            ax.scatter(snapped_x, spend_to_plot, s=marker_size, c=color,
+                      alpha=alpha, edgecolors='white' if ch == selected_channel else 'none',
+                      linewidth=2, zorder=zorder)
+
+        # Add week labels on x-axis
+        ax.set_xticks(snapped_x[::2])  # Every other puck to avoid crowding
+        ax.set_xticklabels([f'W{int(x)}' for x in snapped_x[::2]], fontsize=8)
+
+        # Formatting
+        ax.set_xlim(-1, n_weeks_plan)
+        ax.set_ylim(min_spend - max_spend * 0.05, max_spend * 1.1)
+        ax.set_xlabel('Week')
+        ax.set_ylabel('Spend ($)')
+        ax.set_title(f'Budget Editor - Editing: {selected_channel}', fontsize=12, fontweight='bold')
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right', fontsize=8)
+
+        # Add summary for selected channel
+        total_spend = np.sum(current_y) * (n_weeks_plan / len(current_y))  # Extrapolate to full period
+        avg_spend = np.mean(current_y)
+        ax.text(0.02, 0.98, f'{selected_channel}: Total≈${total_spend:,.0f} | Avg=${avg_spend:,.0f}',
+                transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+
+    # Create the ChartPuck widget
+    budget_puck = ChartPuck.from_callback(
+        draw_fn=draw_multi_channel_budget,
+        x_bounds=(-1, n_weeks_plan),
+        y_bounds=(min_spend, max_spend),
+        drag_y_bounds=(min_spend, max_spend),
+        figsize=(14, 6),
+        x=list(original_x),
+        y=list(_selected_spend),
+        puck_color=_channel_colors[selected_channel],
+        puck_radius=12,
+    )
+
+    # Close the figure to prevent duplicate display
+    plt.close()
+
+    # Wrap in marimo widget
+    budget_widget = mo.ui.anywidget(budget_puck)
+    return (
+        ChartPuck,
+        budget_puck,
         budget_widget,
-    ])
+        draw_multi_channel_budget,
+        get_initial_channel_spend,
+        selected_channel,
+    )
+
+
+@app.cell
+def _(budget_widget):
+    # Display the interactive widget
+    budget_widget
     return
 
 
 @app.cell
-def _(df, get_budget_state, historical_spend, sales_timeseries_predictor):
-    # Plot 2: Counterfactual Sales Prediction
-    # This plot reacts to the confirmed budget state
-    
-    mo.stop(
-        sales_timeseries_predictor is None,
-        mo.md("*Click 'Fit Model' above to enable interactive analysis*")
-    )
-    
-    _confirmed_budget = get_budget_state()
-    
-    # Get predicted sales for the confirmed budget
-    _counterfactual_result = sales_timeseries_predictor(
-        _confirmed_budget['direct'],
-        _confirmed_budget['upper'],
-        _confirmed_budget['lower']
-    )
-    _pred_mean = _counterfactual_result['mean']
-    _pred_low = _counterfactual_result['low']
-    _pred_high = _counterfactual_result['high']
-    
-    # Get baseline prediction (historical spend)
-    _baseline_result = sales_timeseries_predictor(
-        historical_spend['direct'],
-        historical_spend['upper'],
-        historical_spend['lower']
-    )
-    _baseline_mean = _baseline_result['mean']
-    
-    # Calculate summary statistics
-    _total_baseline = _baseline_mean.sum()
-    _total_counterfactual = _pred_mean.sum()
-    _total_diff = _total_counterfactual - _total_baseline
-    _pct_diff = (_total_diff / _total_baseline) * 100 if _total_baseline != 0 else 0
-    
-    # Determine if budget has changed from historical
-    _budget_changed = any(
-        not np.allclose(_confirmed_budget[ch], historical_spend[ch], rtol=1e-3)
-        for ch in ['direct', 'upper', 'lower']
-    )
-    
-    # Create visualization
-    _fig, _ax = plt.subplots(figsize=(14, 7))
-    _dates = df["date"].values
-    
-    # Plot actual historical sales in gray
-    _ax.scatter(_dates, df["sales"].values, color='gray', s=15, alpha=0.4, 
-                label='Historical Sales (Observed)', zorder=2)
-    
-    # Determine color based on lift/drop
-    if _total_diff >= 0:
-        _line_color = '#2ca02c'  # Green for positive
-        _fill_color = '#90EE90'
-    else:
-        _line_color = '#d62728'  # Red for negative
-        _fill_color = '#FFB6C1'
-    
-    if _budget_changed:
-        # Plot counterfactual prediction
-        _ax.plot(_dates, _pred_mean, color=_line_color, linewidth=2.5,
-                 label=f'Counterfactual Prediction ({_pct_diff:+.1f}%)')
-        _ax.fill_between(_dates, _pred_low, _pred_high, color=_line_color, alpha=0.2,
-                         label='90% Credible Interval')
-        
-        # Add shaded area showing lift/drop vs baseline
-        _ax.fill_between(_dates, _baseline_mean, _pred_mean, 
-                        color=_fill_color, alpha=0.4, label='Lift/Drop vs Baseline')
-        
-        # Plot baseline (dashed)
-        _ax.plot(_dates, _baseline_mean, color='gray', linestyle='--', linewidth=1.5,
-                 alpha=0.7, label='Baseline (Historical Budget)')
-    else:
-        # No changes yet - just show baseline
-        _ax.plot(_dates, _baseline_mean, color='#1f77b4', linewidth=2,
-                 label='Baseline Prediction')
-        _ax.fill_between(_dates, _baseline_result['low'], _baseline_result['high'], 
-                        color='#1f77b4', alpha=0.2, label='90% Credible Interval')
-    
-    _ax.set_xlabel('Date')
-    _ax.set_ylabel('Sales')
-    _ax.set_title('Counterfactual Sales Prediction')
-    _ax.legend(loc='upper left')
-    _ax.grid(True, alpha=0.3)
-    
-    # Rotate x-axis labels
-    plt.xticks(rotation=45, ha='right')
-    plt.tight_layout()
-    
-    # Summary annotation
-    if _budget_changed:
-        _summary_text = f"Total Sales Change: {_total_diff:+,.0f} ({_pct_diff:+.1f}%)"
-        _ax.annotate(
-            _summary_text,
-            xy=(0.98, 0.02), xycoords='axes fraction',
-            fontsize=12, color=_line_color, fontweight='bold',
-            ha='right', va='bottom',
-            bbox=dict(boxstyle='round,pad=0.4', facecolor='white', 
-                     edgecolor=_line_color, alpha=0.9)
-        )
-    
-    mo.vstack([
-        mo.md("## Plot 2: Counterfactual Sales Prediction"),
-        mo.md("""
-        This plot shows predicted sales based on your **confirmed** budget allocation.
-        - **Gray dots**: Historical observed sales
-        - **Colored line**: Counterfactual prediction with your budget
-        - **Shaded area**: Difference from baseline (green = lift, red = drop)
-        
-        **Note:** This plot updates only when you click "Confirm Budget" above.
-        """),
-        plt.gcf(),
-        mo.md(f"""
-        **Summary:**
-        - Baseline total sales: {_total_baseline:,.0f}
-        - Counterfactual total sales: {_total_counterfactual:,.0f}
-        - **Difference: {_total_diff:+,.0f} ({_pct_diff:+.1f}%)**
-        """) if _budget_changed else mo.md("*Adjust and confirm a budget in Plot 1 to see counterfactual predictions*"),
-    ])
+def _(budget_widget, mo, np, original_x, selected_channel):
+    # Extract and display current budget allocation for selected channel
+    _current_spend_values = np.array(list(budget_widget.value.y))
+
+    # Create a summary table
+    _budget_summary = []
+    for _i, (week, spend) in enumerate(zip(original_x, _current_spend_values)):
+        _budget_summary.append({
+            'Week': f'Week {int(week)}',
+            'Spend': f'${spend:,.0f}',
+        })
+
+    _total_spend = np.sum(_current_spend_values)
+
+    mo.md(f"""
+    ### Current {selected_channel} Budget (Editing)
+
+    **Total Spend (sampled weeks)**: ${_total_spend:,.0f}
+
+    | Week | Spend |
+    |------|-------|
+    """ + '\n'.join([f"| {row['Week']} | {row['Spend']} |" for row in _budget_summary[:8]]) +
+    f"\n| ... | ... |\n| Total | ${_total_spend:,.0f} |")
     return
 
 
-@app.function
-def create_sales_timeseries_predictor(model, inference_data, n_samples=200):
-    """
-    Create a compiled pytensor function for predicted sales time series.
+@app.cell
+def _(
+    budget_widget,
+    confirm_button,
+    get_initial_channel_spend,
+    mo,
+    np,
+    reset_button,
+    selected_channel,
+):
+    # Manage confirmed state using mo.state
+    confirmed_budget_state, set_confirmed_budget = mo.state(get_initial_channel_spend())
 
-    Returns the full mu (predicted sales) time series with uncertainty,
-    allowing counterfactual analysis of different spend scenarios.
+    # Track current puck values
+    _current_puck_values = np.array(list(budget_widget.value.y))
 
-    Parameters
-    ----------
-    model : pm.Model
-        The fitted PyMC model (must have mu Deterministic node)
-    inference_data : InferenceData
-        ArviZ InferenceData with posterior samples
-    n_samples : int
-        Number of posterior samples to use
+    if confirm_button.value:
+        # User clicked Confirm - save current puck values for selected channel
+        _new_budget = confirmed_budget_state.copy()
+        _new_budget[selected_channel] = _current_puck_values.copy()
+        set_confirmed_budget(_new_budget)
+        mo.output.append(mo.md("✅ **Budget confirmed!** Counterfactual plot will update."))
 
-    Returns
-    -------
-    predict_fn : callable
-        Function(spend_direct, spend_upper, spend_lower) -> dict with 'mean', 'low', 'high'
-        Each is a 1D array of length n_dates (time series of predicted sales)
-    """
-    _input_vars = ["spend_direct", "spend_upper", "spend_lower"]
+    if reset_button.value:
+        # User clicked Reset - restore all channels to historical
+        set_confirmed_budget(get_initial_channel_spend())
+        mo.output.append(mo.md("↺ **All channels reset to historical values.**"))
 
-    # Post-processing functions for mean and HDI
-    _mean_fn = lambda x: x.mean(axis=0)
-    _idx_low = int(round((n_samples - 1) * 0.05))
-    _idx_high = int(round((n_samples - 1) * 0.95))
-    _low_fn = lambda x, idx=_idx_low: pt.sort(x, axis=0)[idx]
-    _high_fn = lambda x, idx=_idx_high: pt.sort(x, axis=0)[idx]
+    # Return the confirmed budget for use in Plot 2
+    confirmed_budget = confirmed_budget_state
+    return confirmed_budget, confirmed_budget_state, set_confirmed_budget
 
-    _response_exprs = {
-        'mean': ("mu", _mean_fn),
-        'low': ("mu", _low_fn),
-        'high': ("mu", _high_fn),
-    }
 
-    # Use the general predictor
-    _general_predict_fn = create_frozen_predictor(
-        model=model,
-        inference_data=inference_data,
-        response_exprs=_response_exprs,
-        input_vars=_input_vars,
-        num_samples=n_samples,
-    )
+@app.cell
+def _(mo):
+    mo.md("""
+    ---
+    ## Plot 2: Counterfactual Sales Prediction
 
-    def predict_fn(spend_direct, spend_upper, spend_lower):
+    This plot shows:
+    - **Gray line**: TRUE historical sales (baseline)
+    - **Green/Red line**: Counterfactual prediction based on your **confirmed** budget
+    - **Shaded area**: Difference between counterfactual and historical
+
+    ⚠️ **This plot only updates when you click "Confirm Budget" above.**
+    """)
+    return
+
+
+@app.cell
+def _(
+    TRUE_PARAMS,
+    channels,
+    confirmed_budget,
+    geometric_adstock,
+    historical_sales,
+    logistic_saturation,
+    mmm_model,
+    mo,
+    model_fitted,
+    n_weeks_plan,
+    np,
+    original_x,
+    planning_dates,
+    plt,
+):
+    # ==============================================================================
+    # Create Frozen Predictor for Counterfactual Analysis
+    # ==============================================================================
+
+    def create_frozen_predictor(mmm, true_params):
         """
-        Compute predicted sales time series for given spend scenarios.
+        Create a predictor function using fitted model or true parameters.
 
-        Parameters
-        ----------
-        spend_direct, spend_upper, spend_lower : array-like
-            Spend time series (normalized) for each channel. Should be 1D arrays
-            of the same length representing spend over time.
-
-        Returns
-        -------
-        predictions : dict
-            Keys: 'mean', 'low', 'high'
-            Values: 1D arrays of predicted sales (length = n_dates)
+        If mmm is fitted, uses posterior mean estimates.
+        Otherwise, falls back to true generating parameters.
         """
-        return _general_predict_fn(
-            spend_direct=np.asarray(spend_direct),
-            spend_upper=np.asarray(spend_upper),
-            spend_lower=np.asarray(spend_lower),
+        if mmm is not None and hasattr(mmm, 'idata'):
+            # Use fitted model posterior means
+            import arviz as az
+            summary = az.summary(mmm.idata, var_names=["intercept", "adstock_alpha", "saturation_lam", "saturation_beta"])
+
+            # Extract posterior means
+            intercept = summary.loc["intercept", "mean"]
+            alphas = {}
+            lams = {}
+            betas = {}
+
+            for i, ch in enumerate(["Direct", "Upper_Funnel", "Lower_Funnel"]):
+                alphas[ch] = summary.loc[f"adstock_alpha[{ch}]", "mean"]
+                lams[ch] = summary.loc[f"saturation_lam[{ch}]", "mean"]
+                betas[ch] = summary.loc[f"saturation_beta[{ch}]", "mean"]
+
+            def predict(spend_dict, n_weeks):
+                """Predict sales given spend dictionary."""
+                t = np.arange(n_weeks)
+
+                total_contribution = np.zeros(n_weeks)
+                for ch in ["Direct", "Upper_Funnel", "Lower_Funnel"]:
+                    spend = spend_dict[ch]
+                    adstocked = geometric_adstock(spend / 1000, alphas[ch])
+                    saturated = logistic_saturation(adstocked, lams[ch], betas[ch])
+                    total_contribution += saturated * 10000
+
+                # Use fitted intercept but no trend (keeping it simple)
+                return intercept + total_contribution + true_params["trend_coef"] * t
+
+            return predict
+        else:
+            # Fallback to true parameters
+            def predict(spend_dict, n_weeks):
+                """Predict sales given spend dictionary using true params."""
+                t = np.arange(n_weeks)
+
+                total_contribution = np.zeros(n_weeks)
+                for ch in ["Direct", "Upper_Funnel", "Lower_Funnel"]:
+                    params = true_params[ch]
+                    spend = spend_dict[ch]
+                    adstocked = geometric_adstock(spend / 1000, params["adstock_alpha"])
+                    saturated = logistic_saturation(adstocked, params["saturation_lam"], params["saturation_beta"])
+                    total_contribution += saturated * 10000
+
+                return true_params["intercept"] + true_params["trend_coef"] * t + total_contribution
+
+            return predict
+
+    # Create predictor based on model state
+    predictor = create_frozen_predictor(mmm_model if model_fitted else None, TRUE_PARAMS)
+
+    # ==============================================================================
+    # Compute Counterfactual Sales
+    # ==============================================================================
+
+    # Interpolate confirmed budget to all weeks
+    counterfactual_spend = {}
+    for _channel in channels:
+        _confirmed_spend = confirmed_budget[_channel]
+        counterfactual_spend[_channel] = np.interp(
+            np.arange(n_weeks_plan),
+            original_x,
+            _confirmed_spend
         )
 
-    return predict_fn
+    # Predict counterfactual sales
+    y_counterfactual = predictor(counterfactual_spend, n_weeks_plan)
+
+    # Calculate metrics
+    total_historical = np.sum(historical_sales)
+    total_counterfactual = np.sum(y_counterfactual)
+    sales_diff = total_counterfactual - total_historical
+    lift_pct = (total_counterfactual / total_historical - 1) * 100 if total_historical > 0 else 0
+
+    # ==============================================================================
+    # Create Counterfactual Plot (Non-Interactive)
+    # ==============================================================================
+
+    fig_cf, ax_cf = plt.subplots(figsize=(14, 6))
+
+    week_indices = np.arange(n_weeks_plan)
+
+    # Determine color based on lift
+    cf_color = 'green' if sales_diff >= 0 else 'red'
+
+    # Plot shaded area (difference)
+    ax_cf.fill_between(
+        week_indices,
+        historical_sales,
+        y_counterfactual,
+        alpha=0.3,
+        color=cf_color,
+        label='Lift/Drop'
+    )
+
+    # Plot TRUE historical sales in GRAY
+    ax_cf.plot(
+        week_indices,
+        historical_sales,
+        color='gray',
+        linewidth=2.5,
+        label='Historical (Actual)',
+        marker='o',
+        markersize=4,
+        markevery=4
+    )
+
+    # Plot counterfactual in color
+    ax_cf.plot(
+        week_indices,
+        y_counterfactual,
+        color=cf_color,
+        linewidth=2.5,
+        linestyle='--',
+        label='Counterfactual (Predicted)',
+        marker='D',
+        markersize=5,
+        markevery=4
+    )
+
+    # Formatting
+    ax_cf.set_xlabel('Week', fontsize=11)
+    ax_cf.set_ylabel('Sales', fontsize=11)
+    ax_cf.set_title('Counterfactual Sales Prediction (Updates on Confirm)', fontsize=14, fontweight='bold')
+    ax_cf.legend(loc='upper left', fontsize=10)
+    ax_cf.grid(True, alpha=0.3)
+
+    # Add summary annotation
+    direction_emoji = "📈" if sales_diff >= 0 else "📉"
+    summary_text = f'{direction_emoji} Lift: {sales_diff:+,.0f} ({lift_pct:+.1f}%)'
+    ax_cf.annotate(
+        summary_text,
+        xy=(0.98, 0.98),
+        xycoords='axes fraction',
+        fontsize=12,
+        fontweight='bold',
+        ha='right',
+        va='top',
+        bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor=cf_color, alpha=0.9)
+    )
+
+    # Set x-axis labels
+    ax_cf.set_xticks(week_indices[::4])
+    ax_cf.set_xticklabels([f'W{int(w)}' for w in week_indices[::4]], fontsize=8)
+
+    plt.tight_layout()
+
+    # Display the plot
+    mo.md("### Counterfactual Results")
+    return (
+        ax_cf,
+        cf_color,
+        counterfactual_spend,
+        create_frozen_predictor,
+        direction_emoji,
+        fig_cf,
+        lift_pct,
+        predictor,
+        sales_diff,
+        summary_text,
+        total_counterfactual,
+        total_historical,
+        week_indices,
+        y_counterfactual,
+    )
+
+
+@app.cell
+def _(fig_cf):
+    # Display the counterfactual plot
+    fig_cf
+    return
+
+
+@app.cell
+def _(
+    lift_pct,
+    mo,
+    np,
+    sales_diff,
+    total_counterfactual,
+    total_historical,
+    y_counterfactual,
+):
+    # Summary metrics for counterfactual analysis
+    _direction = "📈 Increase" if sales_diff >= 0 else "📉 Decrease"
+
+    mo.md(f"""
+    ### Counterfactual Summary (Based on Confirmed Budget)
+
+    | Metric | Value |
+    |--------|-------|
+    | Historical Sales (Actual) | ${total_historical:,.0f} |
+    | Counterfactual Sales (Predicted) | ${total_counterfactual:,.0f} |
+    | **Sales {_direction}** | **${sales_diff:+,.0f}** ({lift_pct:+.1f}%) |
+    | Avg Weekly Counterfactual | ${np.mean(y_counterfactual):,.0f} |
+    | Max Weekly Counterfactual | ${np.max(y_counterfactual):,.0f} |
+    | Min Weekly Counterfactual | ${np.min(y_counterfactual):,.0f} |
+    """)
+    return
+
+
+@app.cell
+def _(channels, confirmed_budget, historical_spend, mo, np, original_x):
+    # Show budget comparison: Historical vs Confirmed for all channels
+
+    _comparison_rows = []
+    for _ch in channels:
+        _hist_total = np.sum([historical_spend[_ch][int(i)] for i in original_x])
+        _conf_total = np.sum(confirmed_budget[_ch])
+        _change = _conf_total - _hist_total
+        _change_pct = (_conf_total / _hist_total - 1) * 100 if _hist_total > 0 else 0
+        _comparison_rows.append(f"| {_ch} | ${_hist_total:,.0f} | ${_conf_total:,.0f} | ${_change:+,.0f} ({_change_pct:+.1f}%) |")
+
+    mo.md(f"""
+    ### Budget Comparison (All Channels - Sampled Weeks)
+
+    | Channel | Historical | Confirmed | Change |
+    |---------|------------|-----------|--------|
+    """ + '\n'.join(_comparison_rows))
+    return
 
 
 if __name__ == "__main__":
